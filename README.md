@@ -11,6 +11,8 @@ The "paper" release includes a zip file with all experiments included in the pap
 
 Install all three libraries here included with pip (preferably using a virtual environment) in the following order:
 
+```
 pip3 install -e torch-misc
 pip3 install -e flow
 pip3 install -e dcg
+```
