@@ -20,4 +20,4 @@ pip3 install -e dcg
 
 # Tutorial
 
-We are currently preparing a tutorial for the DCG and Flow libraries, which will be released as soon as possible.
+We have created a tutorial for the ```dcg``` library, which you can find in the tutorial/ folder.
