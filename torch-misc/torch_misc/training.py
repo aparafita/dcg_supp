@@ -12,6 +12,7 @@ Includes functions:
 
 from tempfile import TemporaryFile
 from collections import OrderedDict
+from datetime import datetime
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -131,6 +132,8 @@ def train(
         # Open tqdm as tq, it will be closed at the finally block
         tq = tqdm(total=n_epochs)
         
+    start_time = datetime.now()
+        
     try:
         for epoch in epoch_it():
             # Train
@@ -226,6 +229,9 @@ def train(
     finally:
         if use_tqdm:
             tq.close()
+            
+        end_time = datetime.now()
+        print('Training time: %d seconds' % (end_time - start_time).seconds)
 
     # Load best model before exiting
     # Note that it only exist if we're past the first epoch

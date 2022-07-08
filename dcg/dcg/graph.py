@@ -193,7 +193,7 @@ class CausalGraph(Module):
 
     @classmethod
     def from_definition(
-        cls, definition, node_kwargs=None, global_kwargs=None, head_nodes=None, **kwargs
+        cls, definition, node_kwargs=None, global_kwargs=None, net_f=None, head_nodes=None, **kwargs
     ):
         """Create a CausalGraph from a list of tuples (name, cls, dim, parents).
 
@@ -205,6 +205,9 @@ class CausalGraph(Module):
                 to the node with the corresponding node_name. 
             global_kwargs (dict or None): dictionary used to pass keyword arguments as **global_kwargs
                 to all nodes. node_kwargs can override any kwarg in global_kwargs.
+            net_f (function or None): function (input_dim, output_dim, init=None) 
+                that creates the network that will compute the external parameters theta.
+            head_nodes (list or None): if using multiheaded nodes, pass which nodes act as splitters.
             **kwargs: kwargs passed as **kwargs to the graph's constructor.
                 Note that you can pass these kwargs directly to the method,
                 in contrast with node_kwargs and global_kwargs.
@@ -264,7 +267,7 @@ class CausalGraph(Module):
         # Finally, reorder nodes by the original ordering
         nodes = [ d[name] for name in original_order ]
 
-        return cls(nodes, **kwargs, head_nodes=head_nodes)
+        return cls(nodes, **kwargs, net_f=net_f, head_nodes=head_nodes)
     
 
     def replace(self, original, new_node):
@@ -474,7 +477,7 @@ class CausalGraph(Module):
         }
 
         if n is None: # n = max(size(0))
-            n = max(v.size(0) for v in d.values())
+            n = max((v.size(0) for v in d.values()), default=1)
 
         # Need to be sure that we can broadcast (size(0) divisor of n)
         assert all(not n % v.size(0) for v in d.values()), \
@@ -717,7 +720,7 @@ class CausalGraph(Module):
         else:
             assert isinstance(x, dict)
             x = self._preprocess_dict(x)
-            n = max(v.size(0) for v in x.values())
+            n = max((v.size(0) for v in x.values()), default=1)
             # Note that each node's tensor may have less than n samples.
             # This is no problem, since node._process_parents 
             # already does the broadcasting.
@@ -726,7 +729,25 @@ class CausalGraph(Module):
 
         return x, n
     
-    def _broadcast_procedure(self, n, x, *ds, ex_n=None, broadcast=None):
+    def _preprocess_fX(self, f, X):
+        if f is not None:
+            if not isinstance(f, (list, tuple)):
+                f = [f]
+
+            l = []
+            for fi in f:
+                if isinstance(fi, (str, CausalNode)):
+                    node = self[fi]
+                    l.append(X[:, self.index(node)])
+                else:
+                    l.append(fi(X))
+                    assert len(l[-1].shape) == 2, 'f must return a bidimensional tensor'
+
+            X = torch.cat(l, 1)
+            
+        return X
+    
+    def _broadcast_procedure(self, n, x, *ds, ex_n=None, broadcast=None, sample=True):
         assert ex_n is not None
         
         if broadcast is None:
@@ -768,13 +789,46 @@ class CausalGraph(Module):
             for d in ds
         ]
 
-        _, x = self.sample(n, interventions=x, return_all=True)
+        if sample:
+            _, x = self.sample(n, interventions=x, return_all=True)
         
         return nb_idx, b_idx, recover_idx, n, x, m, *ds
+    
+    @requires_init
+    def cond_exp(self, x, f=None, ex_n=100):
+        """Compute the Conditional Expectation of f(V) given conditioning dict x."""
+        x = self._preprocess_dict(x)
+        n = max(v.size(0) for v in x.values())
+        _, _, _, n, x, _ = self._broadcast_procedure(n, x, ex_n=ex_n, sample=False)
+
+        original_x = { k: v for k, v in x.items() }
+
+        # Sample the remaining ex_noise
+        x.update({
+            ex: ex.sample(n)
+            for node in self.observable_nodes
+            if node not in x
+            for ex in node.ex_noise
+        })
+
+        # Sample U
+        x.update({
+            u: u.sample(n)
+            for u in self.latent_nodes
+        })
+
+        x, d = self.sample(n, interventions=x, return_all=True)
+        x = self._preprocess_fX(f, x)
+        d = { k: v for k, v in d.items() if k not in original_x and k in self.observable_nodes }
+
+        x = x.view(ex_n, -1, *([x.size(1)] if len(x.shape) > 1 else []))
+        w = torch.softmax(self.loglk(original_x, cond=d).view(ex_n, -1, 1), 0)
+
+        return (x * w).sum(0)
 
     @requires_init
     def loglk(
-        self, x, target_node=None, interventions=None, ex_n=100,
+        self, x, target_node=None, interventions=None, cond=None, ex_n=100,
     ):
         r"""Compute the Log-Likelihood of a sample x.
 
@@ -793,6 +847,7 @@ class CausalGraph(Module):
                 and they will be transformed and broadcasted to all n samples.
                 Note that intervened nodes won't sum their loglk values,
                 as their probability is 1.
+            cond (dict): conditioning term for the loglk.
             ex_n (int): how many samples to create per x sample
                 if the total law of probability is required.
 
@@ -807,8 +862,15 @@ class CausalGraph(Module):
 
         $$f(X) = \mathbb{E}_{\mathcal{V} - X}[ f(X \mid \mathcal{V} - X) ]$$
         """
-
+        
         x, n = self._preprocess_x(x) # note that this copies x
+        
+        if cond is not None:
+            x.update({ k: v for k, v in cond.items() })
+            loglk = partial(self.loglk, target_node=target_node, interventions=interventions, ex_n=ex_n)
+            
+            return loglk(x) - loglk(cond)
+        
         original_n = n
 
         if target_node is not None:
@@ -892,7 +954,7 @@ class CausalGraph(Module):
     
     @requires_init
     def counterfactual(
-        self, x, target_node=None, interventions=None, ex_n=100, agg=True
+        self, x, target_node=None, interventions=None, ex_n=100, f=None, agg=True
     ):
         """Counterfactual estimation.
 
@@ -910,24 +972,36 @@ class CausalGraph(Module):
 
         Args:
             x: torch.Tensor or dict with observed samples.
+            target_node: node to subselect once counterfactuals are sampled.
+                Necessary to avoid sampling unnecessary nodes.
             interventions (dict): intervention values.
             ex_n (int): how many extra samples to take per x sample, if needed.
+            f (func): function for which to compute the expectation. 
+                Transforms the subsampled cf[target_node] (or cf if target_node is None).
             agg (bool): whether to aggregate extra samples.
                 Note that the format of the return depends on this value.
 
         Returns:
             `x`: 
                 tensor of shape (n, graph.dim), only if agg=True.
-            `(x, w)`:
+            `(x, w, nb_idx, b_idx, recover_idx)`:
                 Only if agg=False.
-                x is a tensor of shape (ex_n, n, graph.dim).
-                w is a tensor of shape (ex_n, n, graph.dim)
+                x is a tensor of shape (ex_n, n, dim), 
+                    where dim is either graph.dim, target_node.dim or f(...).size(1).
+                w is a tensor of shape (ex_n, n, 1)
                     or of no shape (1, if there weren't extra samples).
+                    Contains the pre-softmax weights.
+                nb_idx: indexer for non-broadcasted entries.
+                b_idx: indexer for broadcasted entries.
+                recover_idx: indexer to recover the original ordering once aggregation
+                    has been taken care of.
 
-        Use agg=False if you want to compute a function of the counterfactuals.
-        Then, aggregate each result like this:
+        If you want the expectation of a function of the counterfactuals, 
+        pass the desired function f and agg=True.
+        
+        Alternatively, pass agg=False and aggregate the results:
             ```python
-            z = (f(x) * w).sum(dim=0)
+            z = (f(x) * softmax(w)).sum(dim=0)
             ```
         """
 
@@ -1027,11 +1101,13 @@ class CausalGraph(Module):
         else:
             x = x[target_node]
             
+        x = self._preprocess_fX(f, x)
+            
         if agg:
             ex_n = n // original_n
             w = torch.softmax(w[len(nb_idx):].view(ex_n, -1), dim=0).unsqueeze(2)
             x = torch.cat([
-                x[:len(nb_idx)],
+                x[:len(nb_idx)], # nb needs no aggregation, as it hasn't been broadcasted
                 (x[len(nb_idx):].view(ex_n, -1, x.size(1)) * w).sum(0)
             ], 0)
 

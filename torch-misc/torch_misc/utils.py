@@ -20,7 +20,7 @@ def softplus_inv(x, eps=1e-6, threshold=20.):
 
     idx = x < threshold
     # We deliberately ignore eps to avoid -inf
-    y[idx] = torch.log(torch.exp(x[idx]) - 1)
+    y[idx] = torch.log(torch.exp(x[idx] + eps) - 1)
     y[~idx] = x[~idx]
 
     return y
